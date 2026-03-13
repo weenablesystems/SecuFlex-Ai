@@ -1,0 +1,7 @@
+{
+  "name": " 🚨SecuFlow™ POWERED BY: 🌐SA-iLabs",
+  "description": "AI Command Center for Physical Security Operations. Automating intake, triage, dispatch, and compliance reporting.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
