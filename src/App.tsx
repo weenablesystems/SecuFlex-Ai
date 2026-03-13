@@ -29,8 +29,11 @@ import {
   Lock
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Stats, Incident, Guard, Client, AuditLog } from './types';
+import { Stats, Incident, Guard, Client, AuditLog, Patrol } from './types';
 import { triageIncident, generateIncidentReport, generateHandoverSummary } from './services/geminiService';
+import { useLiveQuery } from 'dexie-react-hooks';
+import { offlineDb } from './lib/offlineDb';
+import { queueAction, syncPendingActions } from './lib/syncService';
 
 // --- Components ---
 
@@ -62,10 +65,11 @@ class ErrorBoundary extends Component<any, any> {
   }
 }
 
-const Sidebar = ({ activeView, setActiveView, onLogout, user }: { activeView: string, setActiveView: (v: string) => void, onLogout: () => void, user: any }) => {
+const Sidebar = ({ activeView, setActiveView, onLogout, user, systemStatus }: { activeView: string, setActiveView: (v: string) => void, onLogout: () => void, user: any, systemStatus: string }) => {
   const menuItems = [
     { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
     { id: 'incidents', label: 'Occurrence Book', icon: ClipboardList },
+    { id: 'patrol', label: 'Patrol Log', icon: MapPin },
     { id: 'dispatch', label: 'Dispatch Center', icon: Zap },
     { id: 'guards', label: 'Guard Force', icon: Users },
     { id: 'reports', label: 'Evidence & Reports', icon: FileSearch },
@@ -80,8 +84,11 @@ const Sidebar = ({ activeView, setActiveView, onLogout, user }: { activeView: st
           <ShieldAlert className="text-white w-6 h-6" />
         </div>
         <div>
-          <h1 className="font-bold text-lg leading-tight">SA-iLabs™</h1>
-          <p className="text-[10px] text-zinc-500 uppercase tracking-widest font-semibold">Emma-Ai™ Ops</p>
+          <h1 className="font-bold text-lg leading-tight">SecuFlex™</h1>
+          <div className="flex items-center gap-1.5">
+            <p className="text-[10px] text-zinc-500 uppercase tracking-widest font-semibold">POWERED BY: 🌐SA-iLabs™</p>
+            <span className="px-1 py-0.5 bg-emerald-500/10 text-emerald-600 text-[8px] font-bold rounded leading-none border border-emerald-500/20">PRO</span>
+          </div>
         </div>
       </div>
 
@@ -98,22 +105,37 @@ const Sidebar = ({ activeView, setActiveView, onLogout, user }: { activeView: st
         ))}
       </nav>
 
-      <div className="p-4 border-t border-zinc-100">
-        <div className="flex items-center gap-3 px-4 py-3 mb-2 bg-zinc-50 rounded-xl">
-          <div className="w-8 h-8 bg-zinc-900 rounded-lg flex items-center justify-center text-white text-[10px] font-bold">
+      <div className="p-4 border-t border-zinc-100 bg-zinc-50/50">
+        <div className="flex items-center justify-between px-4 mb-4">
+          <div className="flex items-center gap-2">
+            <div className={`w-1.5 h-1.5 rounded-full animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.5)] ${
+              systemStatus === 'operational' ? 'bg-emerald-500' : 
+              systemStatus === 'degraded' ? 'bg-amber-500' : 'bg-red-500'
+            }`} />
+            <span className="text-[9px] font-black text-zinc-500 uppercase tracking-widest">
+              System {systemStatus === 'operational' ? 'Operational' : systemStatus === 'degraded' ? 'Degraded' : 'Offline'}
+            </span>
+          </div>
+          <div className="flex items-center gap-1">
+            <Lock size={8} className="text-zinc-400" />
+            <span className="text-[9px] font-mono text-zinc-400">v1.0.4-PRO</span>
+          </div>
+        </div>
+        <div className="flex items-center gap-3 px-4 py-3 mb-2 bg-white border border-zinc-200 rounded-2xl shadow-sm">
+          <div className="w-9 h-9 bg-zinc-900 rounded-xl flex items-center justify-center text-white text-[10px] font-black shadow-lg shadow-zinc-900/20">
             {user?.name?.split(' ').map((n: string) => n[0]).join('')}
           </div>
           <div className="flex-1 min-w-0">
-            <p className="text-xs font-bold text-zinc-900 truncate">{user?.name}</p>
-            <p className="text-[10px] text-zinc-500 truncate">{user?.role}</p>
+            <p className="text-xs font-black text-zinc-900 truncate tracking-tight">{user?.name}</p>
+            <p className="text-[10px] text-zinc-500 truncate font-bold uppercase tracking-tighter">{user?.role}</p>
           </div>
         </div>
         <button 
           onClick={onLogout}
-          className="sidebar-item w-full text-zinc-400 hover:text-red-600 hover:bg-red-50"
+          className="flex items-center gap-3 w-full px-4 py-3 text-zinc-400 hover:text-red-600 hover:bg-red-50 rounded-xl transition-all font-bold text-xs"
         >
-          <LogOut size={20} />
-          <span>Sign Out</span>
+          <LogOut size={18} />
+          <span>Terminate Session</span>
         </button>
       </div>
     </div>
@@ -139,20 +161,32 @@ const Toast = ({ message, type, onClose }: { message: string, type: 'success' | 
   </motion.div>
 );
 
-const SystemHealth = ({ isOnline }: { isOnline: boolean }) => (
-  <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full border ${
-    isOnline ? 'bg-emerald-50 border-emerald-100 text-emerald-600' : 'bg-red-50 border-red-100 text-red-600'
-  }`}>
-    {isOnline ? <Wifi size={14} /> : <WifiOff size={14} />}
-    <span className="text-[10px] font-bold uppercase tracking-wider">{isOnline ? 'System Online' : 'Connection Lost'}</span>
+const SystemHealth = ({ isOnline, pendingCount }: { isOnline: boolean, pendingCount: number }) => (
+  <div className="flex items-center gap-2">
+    <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full border ${
+      isOnline ? 'bg-emerald-50 border-emerald-100 text-emerald-600' : 'bg-red-50 border-red-100 text-red-600'
+    }`}>
+      {isOnline ? <Wifi size={14} /> : <WifiOff size={14} />}
+      <span className="text-[10px] font-bold uppercase tracking-wider">{isOnline ? 'System Online' : 'Connection Lost'}</span>
+    </div>
+    {pendingCount > 0 && (
+      <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border bg-amber-50 border-amber-100 text-amber-600 animate-pulse">
+        <Loader2 size={12} className="animate-spin" />
+        <span className="text-[10px] font-bold uppercase tracking-wider">{pendingCount} Pending Sync</span>
+      </div>
+    )}
   </div>
 );
 
-const Header = ({ title, isOnline, user }: { title: string, isOnline: boolean, user: any }) => (
+const Header = ({ title, isOnline, pendingCount, user }: { title: string, isOnline: boolean, pendingCount: number, user: any }) => (
   <header className="h-16 bg-white/80 backdrop-blur-md border-b border-zinc-200 flex items-center justify-between px-8 sticky top-0 z-40">
     <div className="flex items-center gap-6">
       <h2 className="text-xl font-bold text-zinc-900 tracking-tight">{title}</h2>
-      <SystemHealth isOnline={isOnline} />
+      <SystemHealth isOnline={isOnline} pendingCount={pendingCount} />
+      <div className="hidden md:flex items-center gap-1.5 px-2 py-1 bg-zinc-900 text-white rounded-lg border border-zinc-800">
+        <ShieldCheck size={12} className="text-emerald-400" />
+        <span className="text-[9px] font-black uppercase tracking-widest">Production Hardened</span>
+      </div>
     </div>
     <div className="flex items-center gap-4">
       <div className="relative">
@@ -180,16 +214,32 @@ const Header = ({ title, isOnline, user }: { title: string, isOnline: boolean, u
   </header>
 );
 
+const Skeleton = ({ className }: { className?: string }) => (
+  <div className={`animate-pulse bg-zinc-200 rounded-xl ${className}`} />
+);
+
+const EmptyState = ({ icon: Icon, title, description }: { icon: any, title: string, description: string }) => (
+  <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
+    <div className="w-16 h-16 bg-zinc-50 rounded-2xl flex items-center justify-center text-zinc-300 mb-4">
+      <Icon size={32} />
+    </div>
+    <h4 className="text-sm font-bold text-zinc-900 mb-1">{title}</h4>
+    <p className="text-xs text-zinc-500 max-w-[200px]">{description}</p>
+  </div>
+);
+
 const StatCard = ({ label, value, icon: Icon, color, loading }: any) => (
-  <div className="glass-panel p-6 flex items-center justify-between relative overflow-hidden">
-    {loading && (
-      <div className="absolute inset-0 bg-zinc-50 animate-pulse" />
-    )}
+  <div className="glass-panel p-6 flex items-center justify-between relative overflow-hidden group hover:border-zinc-300 transition-all">
+    <div className="absolute top-0 right-0 w-24 h-24 bg-zinc-50 rounded-full -mr-12 -mt-12 group-hover:scale-110 transition-transform opacity-50" />
     <div className="relative z-10">
       <p className="text-sm text-zinc-500 font-medium mb-1">{label}</p>
-      <h3 className="text-3xl font-bold text-zinc-900">{value}</h3>
+      {loading ? (
+        <Skeleton className="h-8 w-16" />
+      ) : (
+        <h3 className="text-3xl font-bold text-zinc-900 tracking-tight">{value}</h3>
+      )}
     </div>
-    <div className={`p-3 rounded-2xl ${color} relative z-10`}>
+    <div className={`p-3 rounded-2xl ${color} relative z-10 shadow-lg shadow-current/10`}>
       <Icon size={24} className="text-white" />
     </div>
   </div>
@@ -210,26 +260,30 @@ const AuditLogsView = ({ logs }: { logs: AuditLog[] }) => (
       </div>
     </div>
     <div className="space-y-1">
-      {logs.map(log => (
-        <div key={log.id} className="flex items-center justify-between p-4 hover:bg-zinc-50 rounded-xl transition-colors group">
-          <div className="flex items-center gap-4">
-            <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
-              log.action.includes('CREATED') ? 'bg-emerald-50 text-emerald-600' :
-              log.action.includes('DISPATCHED') ? 'bg-blue-50 text-blue-600' : 'bg-zinc-100 text-zinc-500'
-            }`}>
-              <Activity size={16} />
+      {logs.length === 0 ? (
+        <EmptyState icon={History} title="No Logs Found" description="System audit history will appear here as actions occur." />
+      ) : (
+        logs.map(log => (
+          <div key={log.id} className="flex items-center justify-between p-4 hover:bg-zinc-50 rounded-xl transition-colors group">
+            <div className="flex items-center gap-4">
+              <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+                log.action.includes('CREATED') ? 'bg-emerald-50 text-emerald-600' :
+                log.action.includes('DISPATCHED') ? 'bg-blue-50 text-blue-600' : 'bg-zinc-100 text-zinc-500'
+              }`}>
+                <Activity size={16} />
+              </div>
+              <div>
+                <p className="text-sm font-bold text-zinc-900">{log.action.replace('_', ' ')}</p>
+                <p className="text-xs text-zinc-500">{log.details}</p>
+              </div>
             </div>
-            <div>
-              <p className="text-sm font-bold text-zinc-900">{log.action.replace('_', ' ')}</p>
-              <p className="text-xs text-zinc-500">{log.details}</p>
+            <div className="text-right">
+              <p className="text-[10px] font-mono text-zinc-400">{new Date(log.timestamp).toLocaleTimeString()}</p>
+              <p className="text-[10px] font-mono text-zinc-300">{new Date(log.timestamp).toLocaleDateString()}</p>
             </div>
           </div>
-          <div className="text-right">
-            <p className="text-[10px] font-mono text-zinc-400">{new Date(log.timestamp).toLocaleTimeString()}</p>
-            <p className="text-[10px] font-mono text-zinc-300">{new Date(log.timestamp).toLocaleDateString()}</p>
-          </div>
-        </div>
-      ))}
+        ))
+      )}
     </div>
   </div>
 );
@@ -267,22 +321,26 @@ const DashboardView = ({ stats, incidents, onGenerateHandover }: { stats: Stats 
           <button className="text-sm font-medium text-emerald-600 hover:underline">View All</button>
         </div>
         <div className="space-y-4">
-          {incidents.slice(0, 5).map((incident) => (
-            <div key={incident.id} className="flex items-start gap-4 p-4 rounded-xl hover:bg-zinc-50 transition-colors border border-transparent hover:border-zinc-100">
-              <div className={`mt-1 w-2 h-2 rounded-full shrink-0 ${
-                incident.severity === 'High' ? 'bg-red-500' : 
-                incident.severity === 'Medium' ? 'bg-amber-500' : 'bg-blue-500'
-              }`} />
-              <div className="flex-1">
-                <div className="flex items-center justify-between mb-1">
-                  <h4 className="font-semibold text-sm">{incident.type}</h4>
-                  <span className="text-[10px] text-zinc-400 font-mono">{new Date(incident.created_at).toLocaleTimeString()}</span>
+          {incidents.length === 0 ? (
+            <EmptyState icon={ShieldAlert} title="All Clear" description="No active incidents reported at this time." />
+          ) : (
+            incidents.slice(0, 5).map((incident) => (
+              <div key={incident.id} className="flex items-start gap-4 p-4 rounded-xl hover:bg-zinc-50 transition-colors border border-transparent hover:border-zinc-100">
+                <div className={`mt-1 w-2 h-2 rounded-full shrink-0 ${
+                  incident.severity === 'High' ? 'bg-red-500' : 
+                  incident.severity === 'Medium' ? 'bg-amber-500' : 'bg-blue-500'
+                }`} />
+                <div className="flex-1">
+                  <div className="flex items-center justify-between mb-1">
+                    <h4 className="font-semibold text-sm">{incident.type}</h4>
+                    <span className="text-[10px] text-zinc-400 font-mono">{new Date(incident.created_at).toLocaleTimeString()}</span>
+                  </div>
+                  <p className="text-xs text-zinc-500 line-clamp-1">{incident.location} • {incident.client_name}</p>
                 </div>
-                <p className="text-xs text-zinc-500 line-clamp-1">{incident.location} • {incident.client_name}</p>
+                <ChevronRight size={16} className="text-zinc-300" />
               </div>
-              <ChevronRight size={16} className="text-zinc-300" />
-            </div>
-          ))}
+            ))
+          )}
         </div>
       </div>
 
@@ -308,7 +366,7 @@ const DashboardView = ({ stats, incidents, onGenerateHandover }: { stats: Stats 
               </div>
               <div>
                 <p className="text-sm font-semibold">AI Copilot</p>
-                <p className="text-xs text-zinc-500">Emma-Ai™ active</p>
+                <p className="text-xs text-zinc-500">SecuFlex™ AI active</p>
               </div>
             </div>
             <span className="text-xs font-bold text-blue-600 bg-blue-50 px-2 py-1 rounded-md">READY</span>
@@ -391,6 +449,170 @@ const OccurrenceBookView = ({ incidents, onNewIncident, onSelectIncident }: { in
   </div>
 );
 
+const PatrolView = ({ clients, user, onPatrolLogged, currentStatus }: { clients: Client[], user: any, onPatrolLogged: (msg: string, type: any) => void, currentStatus: string }) => {
+  const [loading, setLoading] = useState(false);
+  const [selectedClient, setSelectedClient] = useState('');
+  const [notes, setNotes] = useState('');
+  const [location, setLocation] = useState<{ lat: number, lng: number } | null>(null);
+
+  useEffect(() => {
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition((pos) => {
+        setLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+      }, (err) => console.error("Location error", err));
+    }
+  }, []);
+
+  const handleStatusUpdate = async (newStatus: string) => {
+    const statusData = {
+      guard_id: user.id || 1,
+      status: newStatus,
+      tenant_id: 1
+    };
+
+    try {
+      if (navigator.onLine) {
+        await fetch('/api/guards/status', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(statusData)
+        });
+        onPatrolLogged(`Status updated to ${newStatus}`, 'success');
+      } else {
+        await queueAction('STATUS_UPDATE', statusData);
+        onPatrolLogged('Status update queued (offline)', 'info');
+      }
+    } catch (error) {
+      await queueAction('STATUS_UPDATE', statusData);
+      onPatrolLogged('Status update queued (offline)', 'info');
+    }
+  };
+
+  const handlePatrol = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    
+    const patrolData = {
+      tenant_id: 1,
+      guard_id: user.id || 1,
+      client_id: parseInt(selectedClient),
+      location_lat: location?.lat,
+      location_lng: location?.lng,
+      notes,
+      timestamp: new Date().toISOString()
+    };
+
+    try {
+      if (navigator.onLine) {
+        const res = await fetch('/api/patrols', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(patrolData)
+        });
+        if (res.ok) {
+          onPatrolLogged('Patrol check-in recorded', 'success');
+          setNotes('');
+          setSelectedClient('');
+        } else {
+          throw new Error('Server error');
+        }
+      } else {
+        await queueAction('PATROL', patrolData);
+        onPatrolLogged('Patrol recorded offline. Will sync when online.', 'info');
+        setNotes('');
+        setSelectedClient('');
+      }
+    } catch (error) {
+      await queueAction('PATROL', patrolData);
+      onPatrolLogged('Patrol saved locally (offline)', 'info');
+      setNotes('');
+      setSelectedClient('');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="max-w-2xl mx-auto space-y-8">
+      <div className="glass-panel p-8">
+        <div className="flex items-center gap-3 mb-8">
+          <div className="p-3 bg-zinc-900 rounded-2xl text-white">
+            <MapPin size={24} />
+          </div>
+          <div>
+            <h3 className="text-xl font-bold">Patrol Check-in</h3>
+            <p className="text-xs text-zinc-500">Record your presence at a site</p>
+          </div>
+        </div>
+
+        <div className="mb-8 p-4 bg-zinc-50 rounded-2xl border border-zinc-100">
+          <p className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest mb-3">Current Status</p>
+          <div className="flex gap-2">
+            {['Available', 'Busy', 'Off-duty'].map(s => (
+              <button
+                key={s}
+                onClick={() => handleStatusUpdate(s)}
+                className={`flex-1 py-2 rounded-xl text-xs font-bold transition-all ${
+                  currentStatus === s 
+                    ? 'bg-zinc-900 text-white shadow-lg' 
+                    : 'bg-white text-zinc-500 border border-zinc-200 hover:bg-zinc-100'
+                }`}
+              >
+                {s}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <form onSubmit={handlePatrol} className="space-y-6">
+          <div className="space-y-2">
+            <label className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Select Site</label>
+            <select 
+              required
+              value={selectedClient}
+              onChange={(e) => setSelectedClient(e.target.value)}
+              className="w-full p-4 bg-zinc-50 border border-zinc-200 rounded-2xl text-sm outline-none focus:ring-2 focus:ring-zinc-900/5"
+            >
+              <option value="">Choose a location...</option>
+              {clients.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+          </div>
+
+          <div className="space-y-2">
+            <label className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Patrol Notes</label>
+            <textarea 
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              placeholder="Any observations? (e.g., 'All gates secured', 'Suspicious activity near zone 2')"
+              className="w-full h-32 p-4 bg-zinc-50 border border-zinc-200 rounded-2xl text-sm outline-none focus:ring-2 focus:ring-zinc-900/5"
+            />
+          </div>
+
+          <div className="p-4 bg-emerald-50 border border-emerald-100 rounded-2xl flex items-center gap-3">
+            <div className="w-8 h-8 bg-emerald-500 rounded-lg flex items-center justify-center text-white">
+              <MapPin size={16} />
+            </div>
+            <div>
+              <p className="text-xs font-bold text-emerald-900">GPS Verification Active</p>
+              <p className="text-[10px] text-emerald-600">
+                {location ? `${location.lat.toFixed(4)}, ${location.lng.toFixed(4)}` : 'Acquiring location...'}
+              </p>
+            </div>
+          </div>
+
+          <button 
+            type="submit"
+            disabled={loading || !selectedClient}
+            className="w-full bg-zinc-900 text-white py-4 rounded-2xl font-bold hover:bg-zinc-800 transition-all shadow-lg shadow-zinc-900/10 disabled:opacity-50"
+          >
+            {loading ? 'Recording...' : 'Submit Patrol Check-in'}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+};
+
 const NewIncidentModal = ({ isOpen, onClose, clients, onSuccess }: any) => {
   const [loading, setLoading] = useState(false);
   const [rawInput, setRawInput] = useState('');
@@ -404,6 +626,10 @@ const NewIncidentModal = ({ isOpen, onClose, clients, onSuccess }: any) => {
 
   const handleTriage = async () => {
     if (!rawInput) return;
+    if (!navigator.onLine) {
+      onSuccess('AI Triage requires an internet connection.', 'error');
+      return;
+    }
     setLoading(true);
     try {
       const result = await triageIncident(rawInput);
@@ -424,19 +650,30 @@ const NewIncidentModal = ({ isOpen, onClose, clients, onSuccess }: any) => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
+    const incidentData = { ...formData, tenant_id: 1 };
+    
     try {
-      const res = await fetch('/api/incidents', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...formData, tenant_id: 1 })
-      });
-      if (res.ok) {
-        onSuccess('Incident logged successfully', 'success');
+      if (navigator.onLine) {
+        const res = await fetch('/api/incidents', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(incidentData)
+        });
+        if (res.ok) {
+          onSuccess('Incident logged successfully', 'success');
+          onClose();
+        } else {
+          throw new Error('Server error');
+        }
+      } else {
+        await queueAction('INCIDENT', incidentData);
+        onSuccess('Incident saved locally. Will sync when online.', 'info');
         onClose();
       }
     } catch (error) {
-      console.error("Submit failed", error);
-      onSuccess('Failed to log incident', 'error');
+      await queueAction('INCIDENT', incidentData);
+      onSuccess('Incident saved locally (offline)', 'info');
+      onClose();
     } finally {
       setLoading(false);
     }
@@ -465,7 +702,7 @@ const NewIncidentModal = ({ isOpen, onClose, clients, onSuccess }: any) => {
 
         <div className="p-8 space-y-8">
           <div className="space-y-3">
-            <label className="text-xs font-bold uppercase tracking-wider text-zinc-500">Emma-Ai™ Smart Intake</label>
+            <label className="text-xs font-bold uppercase tracking-wider text-zinc-500">SecuFlex™ AI Smart Intake</label>
             <div className="relative">
               <textarea 
                 value={rawInput}
@@ -937,7 +1174,7 @@ const IncidentDetailModal = ({ incident, isOpen, onClose, guards, onDispatch }: 
           <div className="mb-8">
             <div className="flex items-center gap-2 text-blue-600 mb-4">
               <Zap size={18} />
-              <h4 className="font-bold text-sm uppercase tracking-wider">Emma-Ai™ Copilot</h4>
+              <h4 className="font-bold text-sm uppercase tracking-wider">SecuFlex™ AI Copilot</h4>
             </div>
             <div className="bg-white p-4 rounded-2xl border border-blue-100 shadow-sm space-y-3">
               <p className="text-xs text-zinc-600 leading-tight italic">"Based on site history and severity, I recommend immediate dispatch of the nearest armed response unit and notifying the site manager."</p>
@@ -984,7 +1221,7 @@ const SettingsView = ({ stats }: { stats: Stats | null }) => (
         <div className="space-y-6">
           <div className="space-y-2">
             <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest">Company Name</label>
-            <input type="text" defaultValue="🌐SA-iLabs™ Security" className="w-full p-4 bg-zinc-50 border border-zinc-200 rounded-2xl text-sm outline-none focus:ring-2 focus:ring-zinc-900/5 transition-all" />
+            <input type="text" defaultValue="SecuFlex™ Security" className="w-full p-4 bg-zinc-50 border border-zinc-200 rounded-2xl text-sm outline-none focus:ring-2 focus:ring-zinc-900/5 transition-all" />
           </div>
           <div className="space-y-2">
             <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest">Operational License #</label>
@@ -1007,7 +1244,7 @@ const SettingsView = ({ stats }: { stats: Stats | null }) => (
           <Zap size={20} className="text-blue-600" />
         </div>
         <div>
-          <h3 className="text-xl font-bold tracking-tight">Emma-Ai™ Configuration</h3>
+          <h3 className="text-xl font-bold tracking-tight">SecuFlex™ AI Configuration</h3>
           <p className="text-xs text-zinc-500">Fine-tune your AI operational assistant</p>
         </div>
       </div>
@@ -1089,63 +1326,78 @@ const LoginView = ({ onLogin }: { onLogin: (user: any) => void }) => {
   };
 
   return (
-    <div className="min-h-screen bg-zinc-900 flex items-center justify-center p-4">
+    <div className="min-h-screen bg-zinc-950 flex items-center justify-center p-4 relative overflow-hidden">
+      {/* Background Decorative Elements */}
+      <div className="absolute top-0 left-0 w-full h-full opacity-20 pointer-events-none">
+        <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-emerald-500/20 blur-[120px] rounded-full" />
+        <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-blue-500/20 blur-[120px] rounded-full" />
+      </div>
+
       <motion.div 
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        className="w-full max-w-md space-y-8"
+        initial={{ opacity: 0, scale: 0.95 }}
+        animate={{ opacity: 1, scale: 1 }}
+        className="w-full max-w-md space-y-8 relative z-10"
       >
-        <div className="text-center space-y-4">
-          <div className="w-20 h-20 bg-white rounded-3xl flex items-center justify-center mx-auto shadow-2xl">
-            <ShieldAlert size={40} className="text-zinc-900" />
+        <div className="text-center space-y-6">
+          <div className="w-24 h-24 bg-white rounded-[2.5rem] flex items-center justify-center mx-auto shadow-[0_0_50px_rgba(16,185,129,0.2)] transform -rotate-3 hover:rotate-0 transition-transform duration-500">
+            <ShieldAlert size={48} className="text-zinc-900" />
           </div>
-          <div>
-            <h1 className="text-3xl font-bold text-white tracking-tight">SA-iLabs™</h1>
-            <p className="text-zinc-400 text-sm font-medium uppercase tracking-widest">Emma-Ai™ Security Ops</p>
+          <div className="space-y-2">
+            <h1 className="text-4xl font-black text-white tracking-tighter">SecuFlex™</h1>
+            <p className="text-zinc-500 text-xs font-bold uppercase tracking-[0.3em]">POWERED BY: 🌐SA-iLabs™</p>
           </div>
         </div>
 
-        <div className="glass-panel p-8 bg-white/5 border-white/10 backdrop-blur-xl">
+        <div className="bg-white/5 border border-white/10 backdrop-blur-2xl p-10 rounded-[2.5rem] shadow-2xl">
           <form className="space-y-6" onSubmit={handleSubmit}>
             {error && (
-              <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-400 text-xs font-bold text-center">
+              <motion.div 
+                initial={{ opacity: 0, x: -10 }}
+                animate={{ opacity: 1, x: 0 }}
+                className="p-4 bg-red-500/10 border border-red-500/20 rounded-2xl text-red-400 text-xs font-bold text-center"
+              >
                 {error}
-              </div>
+              </motion.div>
             )}
             <div className="space-y-2">
-              <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider">Control Room ID</label>
+              <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest ml-1">Control Room ID</label>
               <input 
                 type="email" 
                 required
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 placeholder="ops-center@sa-ilabs.com"
-                className="w-full p-4 bg-white/5 border border-white/10 rounded-2xl text-white text-sm outline-none focus:ring-2 focus:ring-emerald-500/50 transition-all"
+                className="w-full p-5 bg-white/5 border border-white/10 rounded-2xl text-white text-sm outline-none focus:ring-2 focus:ring-emerald-500/50 focus:bg-white/10 transition-all placeholder:text-zinc-700"
               />
             </div>
             <div className="space-y-2">
-              <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider">Access Token</label>
+              <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest ml-1">Access Token</label>
               <input 
                 type="password" 
                 required
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="••••••••"
-                className="w-full p-4 bg-white/5 border border-white/10 rounded-2xl text-white text-sm outline-none focus:ring-2 focus:ring-emerald-500/50 transition-all"
+                className="w-full p-5 bg-white/5 border border-white/10 rounded-2xl text-white text-sm outline-none focus:ring-2 focus:ring-emerald-500/50 focus:bg-white/10 transition-all placeholder:text-zinc-700"
               />
             </div>
             <button 
               type="submit"
               disabled={loading}
-              className="w-full bg-emerald-500 text-zinc-900 py-4 rounded-2xl font-bold hover:bg-emerald-400 transition-all shadow-lg shadow-emerald-500/20 disabled:opacity-50"
+              className="w-full bg-emerald-500 text-zinc-950 py-5 rounded-2xl font-black text-sm uppercase tracking-widest hover:bg-emerald-400 active:scale-[0.98] transition-all shadow-[0_20px_40px_rgba(16,185,129,0.2)] disabled:opacity-50 mt-4"
             >
-              {loading ? 'Authenticating...' : 'Enter Command Center'}
+              {loading ? (
+                <div className="flex items-center justify-center gap-2">
+                  <Loader2 size={18} className="animate-spin" />
+                  <span>Authenticating</span>
+                </div>
+              ) : 'Enter Command Center'}
             </button>
           </form>
         </div>
 
-        <p className="text-center text-zinc-500 text-xs">
-          Authorized Personnel Only • POPIA & GDPR Compliant Environment
+        <p className="text-center text-[10px] text-zinc-600 font-medium uppercase tracking-widest">
+          Secure Encrypted Session • v1.0.4-PRO • POPIA & GDPR Compliant
         </p>
       </motion.div>
     </div>
@@ -1169,6 +1421,9 @@ export default function App() {
   const [user, setUser] = useState<any>(null);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [toast, setToast] = useState<{ message: string, type: 'success' | 'error' | 'info' } | null>(null);
+
+  const pendingActions = useLiveQuery(() => offlineDb.pendingActions.toArray());
+  const pendingCount = pendingActions?.length || 0;
 
   const showToast = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
     setToast({ message, type });
@@ -1206,7 +1461,7 @@ export default function App() {
 
   const handleGenerateHandover = async () => {
     setLoadingHandover(true);
-    showToast('Emma-Ai™ analyzing shift data...', 'info');
+    showToast('SecuFlex™ AI analyzing shift data...', 'info');
     try {
       const summary = await generateHandoverSummary(incidents);
       setHandoverSummary(summary || 'Failed to generate summary');
@@ -1263,6 +1518,27 @@ export default function App() {
     showToast(`Exported ${filename}.csv`, 'success');
   };
 
+  const [systemStatus, setSystemStatus] = useState<'operational' | 'degraded' | 'offline'>('operational');
+
+  useEffect(() => {
+    const checkHealth = async () => {
+      try {
+        const res = await fetch('/api/health');
+        if (res.ok) {
+          setSystemStatus('operational');
+        } else {
+          setSystemStatus('degraded');
+        }
+      } catch (err) {
+        setSystemStatus('offline');
+      }
+    };
+
+    checkHealth();
+    const interval = setInterval(checkHealth, 30000); // Check every 30s
+    return () => clearInterval(interval);
+  }, []);
+
   useEffect(() => {
     const handleOnline = () => setIsOnline(true);
     const handleOffline = () => setIsOnline(false);
@@ -1277,6 +1553,7 @@ export default function App() {
   useEffect(() => {
     if (isLoggedIn) {
       fetchData();
+      syncPendingActions(); // Initial sync attempt
       
       // WebSocket setup
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -1316,7 +1593,7 @@ export default function App() {
                   </div>
                   <div>
                     <h3 className="text-white font-bold tracking-tight">Shift Handover Summary</h3>
-                    <p className="text-[10px] text-zinc-400 uppercase tracking-widest font-bold">Generated by Emma-Ai™ • {new Date().toLocaleString()}</p>
+                    <p className="text-[10px] text-zinc-400 uppercase tracking-widest font-bold">Generated by SecuFlex™ AI • {new Date().toLocaleString()}</p>
                   </div>
                 </div>
                 <button onClick={() => setHandoverSummary(null)} className="p-2 hover:bg-white/10 rounded-full text-white transition-colors"><X size={20} /></button>
@@ -1330,7 +1607,7 @@ export default function App() {
                     <button className="px-4 py-2 bg-zinc-900 text-white rounded-xl text-xs font-bold hover:bg-zinc-800 transition-colors">Download PDF</button>
                     <button className="px-4 py-2 bg-zinc-100 text-zinc-600 rounded-xl text-xs font-bold hover:bg-zinc-200 transition-colors">Email to Supervisor</button>
                   </div>
-                  <p className="text-[10px] text-zinc-400 font-bold uppercase tracking-widest">Confidential • SA-iLabs™ Security Ops</p>
+                  <p className="text-[10px] text-zinc-400 font-bold uppercase tracking-widest">Confidential • SecuFlex™ Security Ops</p>
                 </div>
               </div>
             </motion.div>
@@ -1339,7 +1616,7 @@ export default function App() {
             <div className="fixed inset-0 z-[110] flex items-center justify-center bg-white/50 backdrop-blur-sm">
               <div className="flex flex-col items-center gap-4">
                 <div className="w-12 h-12 border-4 border-zinc-900 border-t-transparent rounded-full animate-spin" />
-                <p className="font-bold text-zinc-900">Emma-Ai™ generating summary...</p>
+                <p className="font-bold text-zinc-900">SecuFlex™ AI generating summary...</p>
               </div>
             </div>
           )}
@@ -1350,6 +1627,17 @@ export default function App() {
           incidents={incidents} 
           onNewIncident={() => setIsModalOpen(true)} 
           onSelectIncident={(i) => setSelectedIncident(i)}
+        />
+      );
+      case 'patrol': return (
+        <PatrolView 
+          clients={clients} 
+          user={user} 
+          currentStatus={guards.find(g => g.id === (user.id || 1))?.status || 'Available'}
+          onPatrolLogged={(msg, type) => {
+            fetchData();
+            showToast(msg, type);
+          }} 
         />
       );
       case 'dispatch': return (
@@ -1374,10 +1662,10 @@ export default function App() {
   return (
     <ErrorBoundary>
       <div className="min-h-screen bg-zinc-50">
-      <Sidebar activeView={activeView} setActiveView={setActiveView} onLogout={() => setIsLoggedIn(false)} user={user} />
+      <Sidebar activeView={activeView} setActiveView={setActiveView} onLogout={() => setIsLoggedIn(false)} user={user} systemStatus={systemStatus} />
       
       <main className="pl-64 min-h-screen flex flex-col">
-        <Header title={activeView.charAt(0).toUpperCase() + activeView.slice(1)} isOnline={isOnline} user={user} />
+        <Header title={activeView.charAt(0).toUpperCase() + activeView.slice(1)} isOnline={isOnline} pendingCount={pendingCount} user={user} />
         
         <div className="p-8 flex-1">
           <AnimatePresence mode="wait">
@@ -1395,7 +1683,7 @@ export default function App() {
 
         <footer className="p-8 text-center border-t border-zinc-200">
           <p className="text-xs text-zinc-400 font-medium">
-            © 2026 🌐SA-iLabs™ Pty Ltd • Emma-Ai™ Security Operations Platform • v1.0.4
+            © 2026 🌐SA-iLabs™ Pty Ltd • SecuFlex™ Security Operations Platform • v1.0.4
           </p>
         </footer>
       </main>

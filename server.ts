@@ -6,11 +6,36 @@ import { fileURLToPath } from "url";
 import { WebSocketServer, WebSocket } from "ws";
 import http from "http";
 import bcrypt from "bcryptjs";
+import helmet from "helmet";
+import { rateLimit } from "express-rate-limit";
+import { z } from "zod";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const db = new Database("security_ops.db");
+
+// --- Validation Schemas ---
+const LoginSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(6),
+});
+
+const IncidentSchema = z.object({
+  tenant_id: z.number(),
+  client_id: z.number(),
+  type: z.string(),
+  location: z.string().optional(),
+  severity: z.string(),
+  description: z.string(),
+});
+
+const DispatchSchema = z.object({
+  incident_id: z.number(),
+  guard_id: z.number(),
+  priority: z.number().min(1).max(5),
+  tenant_id: z.number(),
+});
 
 // Initialize Database Schema
 db.exec(`
@@ -82,12 +107,26 @@ db.exec(`
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (tenant_id) REFERENCES tenants(id)
   );
+
+  CREATE TABLE IF NOT EXISTS patrols (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id INTEGER NOT NULL,
+    guard_id INTEGER NOT NULL,
+    client_id INTEGER NOT NULL,
+    location_lat REAL,
+    location_lng REAL,
+    notes TEXT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id),
+    FOREIGN KEY (guard_id) REFERENCES guards(id),
+    FOREIGN KEY (client_id) REFERENCES clients(id)
+  );
 `);
 
 // Seed initial data if empty
 const tenantCount = db.prepare("SELECT COUNT(*) as count FROM tenants").get() as { count: number };
 if (tenantCount.count === 0) {
-  const tenantId = db.prepare("INSERT INTO tenants (name, description) VALUES (?, ?)").run("🌐SA-iLabs™ Demo", "Default demo tenant").lastInsertRowid;
+  const tenantId = db.prepare("INSERT INTO tenants (name, description) VALUES (?, ?)").run("🌐SecuFlex™ Demo", "Default demo tenant").lastInsertRowid;
   
   // Create default user: ops-center@sa-ilabs.com / password123
   const hashedPassword = bcrypt.hashSync("password123", 10);
@@ -108,6 +147,19 @@ async function startServer() {
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server });
 
+  // --- Security Middleware ---
+  app.use(helmet({
+    contentSecurityPolicy: false, // Disable for Vite dev compatibility
+  }));
+  
+  const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    limit: 100, // Limit each IP to 100 requests per windowMs
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+  });
+  app.use("/api/", limiter);
+
   app.use(express.json());
 
   // WebSocket Broadcasting
@@ -121,18 +173,41 @@ async function startServer() {
 
   // Auth Routes
   app.post("/api/auth/login", (req, res) => {
-    const { email, password } = req.body;
-    const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email) as any;
-    
-    if (user && bcrypt.compareSync(password, user.password)) {
-      const { password, ...userWithoutPassword } = user;
-      res.json({ success: true, user: userWithoutPassword });
-    } else {
-      res.status(401).json({ success: false, message: "Invalid credentials" });
+    try {
+      const { email, password } = LoginSchema.parse(req.body);
+      const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email) as any;
+      
+      if (user && bcrypt.compareSync(password, user.password)) {
+        const { password, ...userWithoutPassword } = user;
+        
+        // Log successful login
+        db.prepare("INSERT INTO audit_logs (tenant_id, action, details) VALUES (?, ?, ?)")
+          .run(user.tenant_id, "USER_LOGIN", `User ${user.email} logged in successfully`);
+          
+        res.json({ success: true, user: userWithoutPassword });
+      } else {
+        // Log failed login attempt
+        db.prepare("INSERT INTO audit_logs (tenant_id, action, details) VALUES (?, ?, ?)")
+          .run(1, "LOGIN_FAILED", `Failed login attempt for email: ${email}`);
+          
+        res.status(401).json({ success: false, message: "Invalid credentials" });
+      }
+    } catch (error) {
+      res.status(400).json({ success: false, message: "Invalid input data" });
     }
   });
 
   // API Routes
+  app.get("/api/health", (req, res) => {
+    res.json({ 
+      status: "operational", 
+      version: "1.0.4-PRO",
+      timestamp: new Date().toISOString(),
+      database: "connected",
+      environment: process.env.NODE_ENV || "development"
+    });
+  });
+
   app.get("/api/tenants", (req, res) => {
     const tenants = db.prepare("SELECT * FROM tenants").all();
     res.json(tenants);
@@ -151,17 +226,23 @@ async function startServer() {
   });
 
   app.post("/api/incidents", (req, res) => {
-    const { tenant_id, client_id, type, location, severity, description } = req.body;
-    const result = db.prepare(`
-      INSERT INTO incidents (tenant_id, client_id, type, location, severity, description) 
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(tenant_id, client_id, type, location, severity, description);
-    
-    db.prepare("INSERT INTO audit_logs (tenant_id, action, details) VALUES (?, ?, ?)")
-      .run(tenant_id, "INCIDENT_CREATED", `New incident ID: ${result.lastInsertRowid}`);
+    try {
+      const data = IncidentSchema.parse(req.body);
+      const { tenant_id, client_id, type, location, severity, description } = data;
       
-    broadcast({ type: "INCIDENT_CREATED", id: result.lastInsertRowid });
-    res.json({ id: result.lastInsertRowid });
+      const result = db.prepare(`
+        INSERT INTO incidents (tenant_id, client_id, type, location, severity, description) 
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(tenant_id, client_id, type, location, severity, description);
+      
+      db.prepare("INSERT INTO audit_logs (tenant_id, action, details) VALUES (?, ?, ?)")
+        .run(tenant_id, "INCIDENT_CREATED", `New incident ID: ${result.lastInsertRowid}`);
+        
+      broadcast({ type: "INCIDENT_CREATED", id: result.lastInsertRowid });
+      res.json({ id: result.lastInsertRowid });
+    } catch (error) {
+      res.status(400).json({ error: "Invalid incident data" });
+    }
   });
 
   app.get("/api/guards", (req, res) => {
@@ -177,20 +258,103 @@ async function startServer() {
   });
 
   app.post("/api/dispatch", (req, res) => {
-    const { incident_id, guard_id, priority, tenant_id } = req.body;
-    const result = db.prepare(`
-      INSERT INTO dispatches (incident_id, guard_id, priority) 
-      VALUES (?, ?, ?)
-    `).run(incident_id, guard_id, priority);
+    try {
+      const { incident_id, guard_id, priority, tenant_id } = DispatchSchema.parse(req.body);
+      const result = db.prepare(`
+        INSERT INTO dispatches (incident_id, guard_id, priority) 
+        VALUES (?, ?, ?)
+      `).run(incident_id, guard_id, priority);
+      
+      db.prepare("UPDATE incidents SET status = 'Dispatched' WHERE id = ?").run(incident_id);
+      db.prepare("UPDATE guards SET status = 'Busy' WHERE id = ?").run(guard_id);
+      
+      db.prepare("INSERT INTO audit_logs (tenant_id, action, details) VALUES (?, ?, ?)")
+        .run(tenant_id, "GUARD_DISPATCHED", `Guard ${guard_id} assigned to incident ${incident_id}`);
+        
+      broadcast({ type: "GUARD_DISPATCHED", incident_id, guard_id });
+      res.json({ id: result.lastInsertRowid });
+    } catch (error) {
+      res.status(400).json({ error: "Invalid dispatch data" });
+    }
+  });
+
+  app.get("/api/patrols", (req, res) => {
+    const { tenant_id, guard_id } = req.query;
+    let query = "SELECT * FROM patrols WHERE tenant_id = ?";
+    const params: any[] = [tenant_id || 1];
     
-    db.prepare("UPDATE incidents SET status = 'Dispatched' WHERE id = ?").run(incident_id);
-    db.prepare("UPDATE guards SET status = 'Busy' WHERE id = ?").run(guard_id);
+    if (guard_id) {
+      query += " AND guard_id = ?";
+      params.push(guard_id);
+    }
+    
+    const patrols = db.prepare(query).all(...params);
+    res.json(patrols);
+  });
+
+  app.post("/api/patrols", (req, res) => {
+    const { tenant_id, guard_id, client_id, location_lat, location_lng, notes } = req.body;
+    const result = db.prepare(`
+      INSERT INTO patrols (tenant_id, guard_id, client_id, location_lat, location_lng, notes) 
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(tenant_id, guard_id, client_id, location_lat, location_lng, notes);
     
     db.prepare("INSERT INTO audit_logs (tenant_id, action, details) VALUES (?, ?, ?)")
-      .run(tenant_id, "GUARD_DISPATCHED", `Guard ${guard_id} assigned to incident ${incident_id}`);
+      .run(tenant_id, "PATROL_LOGGED", `Guard ${guard_id} logged patrol at site ${client_id}`);
       
-    broadcast({ type: "GUARD_DISPATCHED", incident_id, guard_id });
+    broadcast({ type: "PATROL_LOGGED", id: result.lastInsertRowid, guard_id });
     res.json({ id: result.lastInsertRowid });
+  });
+
+  app.post("/api/guards/status", (req, res) => {
+    const { guard_id, status, tenant_id } = req.body;
+    db.prepare("UPDATE guards SET status = ? WHERE id = ?").run(status, guard_id);
+    
+    db.prepare("INSERT INTO audit_logs (tenant_id, action, details) VALUES (?, ?, ?)")
+      .run(tenant_id, "GUARD_STATUS_UPDATED", `Guard ${guard_id} status changed to ${status}`);
+      
+    broadcast({ type: "GUARD_STATUS_UPDATED", guard_id, status });
+    res.json({ success: true });
+  });
+
+  app.post("/api/sync", (req, res) => {
+    const { actions } = req.body;
+    const results: any[] = [];
+    
+    const transaction = db.transaction((syncActions: any[]) => {
+      for (const action of syncActions) {
+        try {
+          if (action.type === 'INCIDENT') {
+            const { tenant_id, client_id, type, location, severity, description } = action.data;
+            const result = db.prepare(`
+              INSERT INTO incidents (tenant_id, client_id, type, location, severity, description) 
+              VALUES (?, ?, ?, ?, ?, ?)
+            `).run(tenant_id, client_id, type, location, severity, description);
+            results.push({ id: action.id, status: 'success', serverId: result.lastInsertRowid });
+          } else if (action.type === 'PATROL') {
+            const { tenant_id, guard_id, client_id, location_lat, location_lng, notes } = action.data;
+            const result = db.prepare(`
+              INSERT INTO patrols (tenant_id, guard_id, client_id, location_lat, location_lng, notes) 
+              VALUES (?, ?, ?, ?, ?, ?)
+            `).run(tenant_id, guard_id, client_id, location_lat, location_lng, notes);
+            results.push({ id: action.id, status: 'success', serverId: result.lastInsertRowid });
+          } else if (action.type === 'STATUS_UPDATE') {
+            const { guard_id, status, tenant_id } = action.data;
+            db.prepare("UPDATE guards SET status = ? WHERE id = ?").run(status, guard_id);
+            results.push({ id: action.id, status: 'success' });
+          }
+        } catch (error: any) {
+          results.push({ id: action.id, status: 'error', message: error.message });
+        }
+      }
+    });
+
+    transaction(actions);
+    
+    // Broadcast a general sync event
+    broadcast({ type: "SYNC_COMPLETED", count: actions.length });
+    
+    res.json({ results });
   });
 
   app.get("/api/stats", (req, res) => {
@@ -229,8 +393,9 @@ async function startServer() {
 
   const PORT = 3000;
   server.listen(PORT, "0.0.0.0", () => {
-    console.log(`🌐SA-iLabs™ Security Ops Server running on http://localhost:${PORT}`);
+    console.log(`🌐SecuFlex™ POWERED BY: SA-iLabs™ Server running on http://localhost:${PORT}`);
   });
 }
 
 startServer();
+

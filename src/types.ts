@@ -56,3 +56,14 @@ export interface AuditLog {
   details: string;
   timestamp: string;
 }
+
+export interface Patrol {
+  id?: number;
+  tenant_id: number;
+  guard_id: number;
+  client_id: number;
+  location_lat?: number;
+  location_lng?: number;
+  notes?: string;
+  timestamp: string;
+}
